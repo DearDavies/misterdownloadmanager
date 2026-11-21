@@ -116,6 +116,18 @@
   "popup_fix": {
     "message": "如何修复"
   },
+  "popup_by_hand": {
+    "message": "此副本是手动加载的，不会自动更新。"
+  },
+  "popup_by_hand_firefox": {
+    "message": "此副本是手动加载的：它不会自行更新，并且浏览器重启时会将其删除。"
+  },
+  "popup_store_chrome": {
+    "message": "从 Chrome 网上应用店添加"
+  },
+  "popup_store_firefox": {
+    "message": "从 addons.mozilla.org 添加"
+  },
   "popup_declined": {
     "message": "已留给浏览器：$name$",
     "placeholders": {
