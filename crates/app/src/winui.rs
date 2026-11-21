@@ -1076,6 +1076,89 @@ pub fn sentence_pieces<'a>(template: &'a str, slots: &[&str]) -> Vec<Vec<Piece<'
         .collect()
 }
 
+/// Each input box's name for screen readers (#1407): the words around it in the translated
+/// sentence, in the sentence's own order — "Download {files} files at the same time" names
+/// its box "Download files at the same time", so a reader says what a box's number is,
+/// whatever language the sentence is translated into (a box first on its line is named by the
+/// words after it, as the Japanese catalog runs it). A sentence holds one box on a line
+/// today; where a line had two, the words between them would join both their names. A box
+/// with no words around it takes the sentence's own words, its placeholders dropped: a
+/// slot's id is code, not a language. Any leftover `{...}` (a placeholder the caller didn't
+/// name a slot) and the `&` of a keyboard letter drop out of a name, as they do out of a
+/// caption ([`caption_for`]).
+pub fn sentence_names(template: &str, slots: &[&str]) -> Vec<String> {
+    let rows = sentence_pieces(template, slots);
+    // The sentence's own words, placeholders dropped: a box alone in a translation still
+    // reads in its language.
+    let sentence = rows
+        .iter()
+        .flatten()
+        .filter_map(|p| match *p {
+            Piece::Text(s) => {
+                let words = name_words(s);
+                (!words.is_empty()).then_some(words)
+            }
+            Piece::Slot(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    slots
+        .iter()
+        .map(|slot| {
+            for row in &rows {
+                // The words before the box, then the ones after it, up to another box.
+                let mut before: Vec<String> = Vec::new();
+                let mut after: Vec<String> = Vec::new();
+                let (mut seen, mut past) = (false, false);
+                for piece in row.iter().copied() {
+                    match piece {
+                        Piece::Text(s) if !past => {
+                            let words = name_words(s);
+                            if !words.is_empty() {
+                                if seen {
+                                    after.push(words);
+                                } else {
+                                    before.push(words);
+                                }
+                            }
+                        }
+                        Piece::Slot(s) if s == *slot => seen = true,
+                        Piece::Slot(_) if seen => past = true,
+                        Piece::Slot(_) => before.clear(),
+                        _ => {}
+                    }
+                }
+                if seen {
+                    before.extend(after);
+                    if !before.is_empty() {
+                        return before.join(" ");
+                    }
+                    break;
+                }
+            }
+            sentence.clone()
+        })
+        .collect()
+}
+
+/// A text piece as part of a name: any leftover `{...}` (a placeholder the caller didn't
+/// name a slot) and the `&` of a keyboard letter drop out, and with them the spaces they
+/// leave behind.
+fn name_words(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut brace = false;
+    for c in s.chars() {
+        match c {
+            '{' => brace = true,
+            '}' => brace = false,
+            '&' => {}
+            _ if !brace => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Where [`sentence`] puts things: (x, baseline, text) for each text piece, and each slot's
 /// rect in `slots` order. `width` measures a text. A right-aligned lead starts no further out
 /// than `near` (the window's edge); the box after it moves on instead.
@@ -6316,6 +6399,23 @@ pub fn to_tray_button(ui: &mut Ui, rc: Rect, id: &str, tip: &str) -> Response {
     resp
 }
 
+/// The flat icon button with a × drawn in the text ink: closes a borderless window of ours that
+/// has no title bar (the tray icon's panel, #1365). `tip` is English, translated here.
+pub fn close_button(ui: &mut Ui, rc: Rect, id: &str, tip: &str) -> Response {
+    let resp = icon_button_light(ui, rc, id, true, tip);
+    let c = rc.center().round();
+    let ink = Stroke::new(1.0, LIGHT_TEXT());
+    // Close's cross, 8 px across, its strokes through pixel centres.
+    let (a, b) = (
+        c + vec2(-4.0, -4.0) + vec2(0.5, 0.5),
+        c + vec2(4.0, 4.0) + vec2(0.5, 0.5),
+    );
+    ui.painter().line_segment([a, b], ink);
+    ui.painter()
+        .line_segment([pos2(a.x, b.y), pos2(b.x, a.y)], ink);
+    resp
+}
+
 /// Our "minimize it away to the notification area" glyph (#63; our own drawing): Minimize's dash
 /// at its height, shortened to 6 of its 10 px on the start side, and from its end a 45° arrow
 /// (shaft about 5.7 px, open head) down towards the screen's corner where the tray is. No
@@ -6633,6 +6733,75 @@ pub mod caption {
                 CaptionButton::ToTray => to_tray_glyph_sized(p, c, s, rtl(), size),
             }
         }
+
+        /// Windows XP's own glyph (Luna, #1612) on a 21-pixel tile whose edge's top-left pixel
+        /// is `at`, as XP's pixels sit on it: Minimize a short thick bar low and to the left,
+        /// Maximize a box with a thick top, Restore two of them, Close a thick X; all whole
+        /// pixels, so crisp (rounded to the screen's at other scales). False for our own button,
+        /// which keeps [`Self::glyph`].
+        fn xp_glyph(self, ui: &Ui, p: &Painter, at: Pos2, ink: Color32, maximized: bool) -> bool {
+            use egui::emath::GuiRounding;
+            // (left, top, right, bottom) in the tile's pixels, right and bottom excluded.
+            type Spans = &'static [(u8, u8, u8, u8)];
+            const MINIMIZE: Spans = &[(5, 13, 12, 16)];
+            const MAXIMIZE: Spans = &[
+                (5, 5, 16, 8),
+                (5, 8, 6, 15),
+                (15, 8, 16, 15),
+                (5, 15, 16, 16),
+            ];
+            // The window behind (its thick top, its right side) and the one in front.
+            const RESTORE: Spans = &[
+                (8, 5, 15, 7),
+                (14, 7, 15, 12),
+                (13, 11, 14, 12),
+                (5, 8, 12, 10),
+                (5, 10, 6, 14),
+                (11, 10, 12, 14),
+                (5, 14, 12, 15),
+            ];
+            const CLOSE: Spans = &[
+                (6, 5, 7, 6),
+                (14, 5, 15, 6),
+                (5, 6, 8, 7),
+                (13, 6, 16, 7),
+                (6, 7, 9, 8),
+                (12, 7, 15, 8),
+                (7, 8, 10, 9),
+                (11, 8, 14, 9),
+                (8, 9, 13, 10),
+                (9, 10, 12, 11),
+                (8, 11, 13, 12),
+                (7, 12, 10, 13),
+                (11, 12, 14, 13),
+                (6, 13, 9, 14),
+                (12, 13, 15, 14),
+                (5, 14, 8, 15),
+                (13, 14, 16, 15),
+                (6, 15, 7, 16),
+                (14, 15, 15, 16),
+            ];
+            let spans = match self {
+                CaptionButton::Minimize => MINIMIZE,
+                CaptionButton::Maximize if maximized => RESTORE,
+                CaptionButton::Maximize => MAXIMIZE,
+                CaptionButton::Close => CLOSE,
+                CaptionButton::ToTray => return false,
+            };
+            // One mesh of whole-pixel quads: no feathering, so no soft or doubled edges, and a
+            // single pixel (the X's tips) is drawn too.
+            let ppp = ui.ctx().pixels_per_point();
+            let mut mesh = egui::Mesh::default();
+            for &(l, t, r, b) in spans {
+                let rc = Rect::from_min_max(
+                    at + vec2(l.into(), t.into()),
+                    at + vec2(r.into(), b.into()),
+                );
+                mesh.add_colored_rect(rc.round_to_pixels(ppp), ink);
+            }
+            p.add(egui::Shape::mesh(mesh));
+            true
+        }
     }
 
     /// Windows keeps the window's own title bar in UI Automation (its "TitleBar", built from the
@@ -6756,7 +6925,8 @@ pub mod caption {
 
     /// An era theme's caption button (#45) in its place `rc`: a shaded tile with an edge, its
     /// own face at rest (Close red; Mac OS X's graphite until the pointer is on it), lighter
-    /// under the pointer and darker pressed, faded while greyed or the window inactive; the
+    /// under the pointer and darker pressed, faded while greyed or the window inactive (or the
+    /// theme's own inactive face, edge and glyph: `caption.button.inactive` and the others); the
     /// glyph light on it (Windows 7's with a shadow), or Mac OS X's dark one shown only under
     /// the pointer. There, our Hide button is a plain picture in the bar, as a toolbar's.
     fn era_button(
@@ -6806,7 +6976,19 @@ pub mod caption {
         } else {
             Rect::from_center_size(at, size)
         };
-        let base = if close && (era != Shine::Aqua || hover || pressed) {
+        // While the window isn't the active one, the theme's own faces for it where it has them
+        // (Windows XP: the buttons and Close half-faded into the bar, their edge and glyph
+        // still crisp), else the button's own faded into the bar, as a greyed one's.
+        let inactive = enabled && !active;
+        let own = if close {
+            c.caption_close_inactive
+        } else {
+            c.caption_button_inactive
+        };
+        let own = (inactive && own.a() > 0).then_some(own);
+        let base = if let Some(own) = own {
+            own
+        } else if close && (era != Shine::Aqua || hover || pressed) {
             CLOSE_HOVER()
         } else {
             CAPTION_BUTTON()
@@ -6818,7 +7000,7 @@ pub mod caption {
         } else {
             base
         };
-        let base = if enabled && active {
+        let base = if (enabled && active) || own.is_some() {
             base
         } else {
             mix(base, bar, 0.55)
@@ -6840,6 +7022,7 @@ pub mod caption {
         };
         fill_shaded_corners(p, tile, top, bottom, &stops);
         let edge = match era {
+            _ if !active && c.caption_edge_inactive.a() > 0 => c.caption_edge_inactive,
             Shine::Luna => c.gloss.gamma_multiply(0.9),
             Shine::Aero => shade(bar, -0.35),
             Shine::Aqua => shade(base, -0.2),
@@ -6863,8 +7046,11 @@ pub mod caption {
                 b.glyph(ui, p, at, CAPTION_INK(), maximized, size, width);
             }
         } else {
+            let glyph = c.caption_glyph_inactive;
             let ink = if enabled && active {
                 CLOSE_INK()
+            } else if inactive && glyph.a() > 0 {
+                glyph
             } else {
                 CLOSE_INK().gamma_multiply(0.7)
             };
@@ -6872,7 +7058,15 @@ pub mod caption {
                 let shadow = Color32::from_black_alpha(110);
                 b.glyph(ui, p, at + vec2(1.0, 1.0), shadow, maximized, size, width);
             }
-            b.glyph(ui, p, at, ink, maximized, size, width);
+            // Windows XP's own glyphs, placed from the tile's edge (its first whole pixel).
+            let ppp = ui.ctx().pixels_per_point();
+            let edge = pos2(
+                (tile.min.x * ppp).ceil() / ppp,
+                (tile.min.y * ppp).ceil() / ppp,
+            );
+            if era != Shine::Luna || !b.xp_glyph(ui, p, edge, ink, maximized) {
+                b.glyph(ui, p, at, ink, maximized, size, width);
+            }
         }
         show_focus(ui, resp, tile);
     }
@@ -8767,6 +8961,64 @@ example.org"; // values typed in, not texts to translate
         assert_eq!(texts[0], (222.0, 346.0, "h:".to_owned()));
         assert_eq!(rects[0].min, pos2(222.0 + w("h:") + 8.0, 330.0));
         assert_eq!(texts[1].0, rects[0].right() + 8.0);
+    }
+
+    #[test]
+    fn the_words_around_a_box_name_it() {
+        // The same sentence `english_lands_where_the_pieces_were` lays out.
+        assert_eq!(
+            sentence_names(
+                "Download no more than {mb} MBytes\nevery {hours} hours",
+                &["mb", "hours"]
+            ),
+            vec![
+                "Download no more than MBytes".to_owned(),
+                "every hours".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_translation_names_a_box_in_its_own_words() {
+        // Boxes first on each line, as `a_translation_moves_the_boxes` places them: the words
+        // between two boxes join both their names.
+        assert_eq!(
+            sentence_names("{hours} h: {mb} MB", &["mb", "hours"]),
+            vec!["h: MB".to_owned(), "h:".to_owned()]
+        );
+        // A box alone on its line takes the sentence's own words, placeholders dropped; a
+        // sentence of nothing but the box names it with nothing.
+        assert_eq!(
+            sentence_names("{mb}\nevery {hours} hours", &["mb"]),
+            vec!["every hours".to_owned()]
+        );
+        assert_eq!(sentence_names("{mb}", &["mb"]), vec![String::new()]);
+    }
+
+    #[test]
+    fn real_translations_name_their_boxes_in_their_own_words() {
+        // Box first, as the Japanese catalog runs it.
+        assert_eq!(
+            sentence_names("{files}個のファイルを同時にダウンロード", &["files"]),
+            vec!["個のファイルを同時にダウンロード".to_owned()]
+        );
+        // Right to left, the words in the sentence's own logical order.
+        assert_eq!(
+            sentence_names("تنزيل {files} ملفا في الوقت نفسه", &["files"]),
+            vec!["تنزيل ملفا في الوقت نفسه".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_leftover_placeholder_and_an_accelerator_letter_drop_out_of_a_name() {
+        assert_eq!(
+            sentence_names("Download {files} {n} files", &["files"]),
+            vec!["Download files".to_owned()]
+        );
+        assert_eq!(
+            sentence_names("D&ownload {files} files", &["files"]),
+            vec!["Download files".to_owned()]
+        );
     }
 
     #[test]
