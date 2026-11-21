@@ -116,6 +116,16 @@ pub fn shade(c: Color32, dl: f32) -> Color32 {
     rgb_of(x)
 }
 
+/// [`shade`], and its colourfulness (OKLab chroma) times `k`: Windows XP's title bar is more
+/// vivid where it is lighter.
+pub fn shade_chroma(c: Color32, dl: f32, k: f32) -> Color32 {
+    let mut x = lab(c);
+    x.l = (x.l + dl).clamp(0.0, 1.0);
+    x.a *= k;
+    x.b *= k;
+    rgb_of(x)
+}
+
 fn with_alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
 }

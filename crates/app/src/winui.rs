@@ -6599,11 +6599,42 @@ pub mod caption {
 
     /// An era's bar, shaded from its top: XP's light edge on a deep colour, Windows 7's glassy
     /// halves, Mac OS X's light grey falling to the bar's colour.
-    fn bar_stops(era: Shine, bar: Color32, g: Color32) -> Vec<(f32, Color32)> {
-        use crate::derive::{mix, shade};
+    fn bar_stops(era: Shine, bar: Color32, g: Color32, active: bool) -> Vec<(f32, Color32)> {
+        use crate::derive::{mix, shade, shade_chroma};
         match era {
+            // Windows XP's active bar, row by row (#1612; measured from XP's own screens, in
+            // the bar's 32 rows at 100 %): a light band under the window's top edge, falling
+            // back to the bar's colour by the seventh row, then lighter and more vivid again
+            // toward the bottom and a dark bottom edge. Each row's colour comes from the bar's
+            // own (on Luna's #0054e3: band #3d95ff, lighter to #0069ff, bottom #0041ce), so dark
+            // Luna's bar is shaded the same way. XP's top row, a rim of about the bar's colour,
+            // is the window's edge: Windows 11 draws its own one-pixel border over that row of
+            // a dialog, and the main window's sizing strip above its bar takes the bar's first
+            // colour, so the band is first, as XP's light top edge.
+            Shine::Luna if active => {
+                let top = |row: f32| (row + 0.5) / CAPTION_H;
+                let end = |row: f32| 1.0 - (row + 0.5) / CAPTION_H;
+                let v = |dl: f32, k: f32| shade_chroma(bar, dl, k);
+                vec![
+                    (top(1.0), v(0.204, 1.11)),
+                    (top(2.0), v(0.204, 1.24)),
+                    (top(3.0), v(0.12, 1.23)),
+                    (top(4.0), v(0.031, 1.04)),
+                    (top(5.0), v(0.014, 1.02)),
+                    (top(7.0), bar),
+                    (end(18.0), bar),
+                    (end(12.0), v(0.017, 1.04)),
+                    (end(8.0), v(0.041, 1.07)),
+                    (end(6.0), v(0.084, 1.17)),
+                    (end(4.0), v(0.084, 1.17)),
+                    (end(3.0), v(0.069, 1.14)),
+                    (end(2.0), v(0.043, 1.08)),
+                    (end(1.0), v(-0.015, 1.04)),
+                    (end(0.0), v(-0.057, 0.99)),
+                ]
+            }
             // A bright rim along the top, the bar's colour, lighter again toward the bottom,
-            // then a dark bottom edge.
+            // then a dark bottom edge (the inactive bar, as #1628 set it).
             Shine::Luna => vec![
                 (0.0, shade(bar, 0.1)),
                 (0.06, shade(bar, 0.13)),
@@ -6976,6 +7007,14 @@ pub mod caption {
         } else {
             Rect::from_center_size(at, size)
         };
+        // The glyph's place, from the tile as laid out (unchanged by the snap below).
+        let glyph_at = tile.center().round();
+        // The tile on whole pixels, once, and both its face and its edge drawn from it: an odd
+        // size centred on a whole point (Luna's 21, Windows 7's 27) has half-pixel sides, where
+        // the face (a mesh, filling every pixel whose centre it covers) began a pixel before
+        // the edge (rounded to whole pixels when drawn), a sliver of the face outside the
+        // button's top and left edge (#1612).
+        let tile = super::snap(ui.ctx().pixels_per_point(), tile);
         // While the window isn't the active one, the theme's own faces for it where it has them
         // (Windows XP: the buttons and Close half-faded into the bar, their edge and glyph
         // still crisp), else the button's own faded into the bar, as a greyed one's.
@@ -7023,7 +7062,8 @@ pub mod caption {
         fill_shaded_corners(p, tile, top, bottom, &stops);
         let edge = match era {
             _ if !active && c.caption_edge_inactive.a() > 0 => c.caption_edge_inactive,
-            Shine::Luna => c.gloss.gamma_multiply(0.9),
+            // Windows XP's edge is the gloss itself (white), not a softened one (#1612).
+            Shine::Luna => c.gloss,
             Shine::Aero => shade(bar, -0.35),
             Shine::Aqua => shade(base, -0.2),
         };
@@ -7039,7 +7079,7 @@ pub mod caption {
             Shine::Aero => (0.9, 1.5),
             Shine::Aqua => (0.55, 1.4),
         };
-        let at = tile.center().round();
+        let at = glyph_at;
         if era == Shine::Aqua {
             // Mac OS X shows its buttons' glyphs only under the pointer.
             if hover || pressed {
@@ -7058,13 +7098,8 @@ pub mod caption {
                 let shadow = Color32::from_black_alpha(110);
                 b.glyph(ui, p, at + vec2(1.0, 1.0), shadow, maximized, size, width);
             }
-            // Windows XP's own glyphs, placed from the tile's edge (its first whole pixel).
-            let ppp = ui.ctx().pixels_per_point();
-            let edge = pos2(
-                (tile.min.x * ppp).ceil() / ppp,
-                (tile.min.y * ppp).ceil() / ppp,
-            );
-            if era != Shine::Luna || !b.xp_glyph(ui, p, edge, ink, maximized) {
+            // Windows XP's own glyphs, placed from the tile's edge (on whole pixels).
+            if era != Shine::Luna || !b.xp_glyph(ui, p, tile.min, ink, maximized) {
                 b.glyph(ui, p, at, ink, maximized, size, width);
             }
         }
@@ -7105,7 +7140,7 @@ pub mod caption {
         let bar = bar_colour(active);
         let top = match st.era {
             Some(era) => {
-                let stops = bar_stops(era, bar, crate::theme::colors().gloss);
+                let stops = bar_stops(era, bar, crate::theme::colors().gloss, active);
                 fill_shaded(&p, rect, 0.0, &stops);
                 stops.first().map_or(bar, |s| s.1)
             }
@@ -7243,6 +7278,42 @@ pub mod caption {
             buttons: rects,
             icon,
             top,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// #1612: Luna's active bar has Windows XP's rows on Luna's own colour (each stop sits on
+        /// a row's centre at 100 %, so it is that row's colour), its light band first, and the
+        /// inactive bar keeps its stops.
+        #[test]
+        fn luna_active_bar_has_xp_rows() {
+            let near = |c: Color32, xp: u32| {
+                let [_, r, g, b] = xp.to_be_bytes();
+                let d = |x: u8, y: u8| x.abs_diff(y);
+                assert!(
+                    d(c.r(), r) <= 3 && d(c.g(), g) <= 3 && d(c.b(), b) <= 3,
+                    "{c:?} vs #{xp:06x}"
+                );
+            };
+            let bar = Color32::from_rgb(0x00, 0x54, 0xe3);
+            let stops = bar_stops(Shine::Luna, bar, Color32::WHITE, true);
+            let at = |row: f32| {
+                let t = (row + 0.5) / CAPTION_H;
+                stops.iter().find(|s| (s.0 - t).abs() < 1e-4).unwrap().1
+            };
+            near(at(1.0), 0x3d95ff); // the light band
+            near(stops[0].1, 0x3d95ff); // first: the sizing strip above takes it
+            near(at(2.0), 0x2b90ff);
+            near(at(7.0), 0x0054e3); // the bar's own colour
+            near(at(CAPTION_H - 7.0), 0x0069ff); // lighter toward the bottom
+            near(at(CAPTION_H - 1.0), 0x0041ce); // the dark bottom edge
+            let inactive = Color32::from_rgb(0x7a, 0x96, 0xdf);
+            let old = bar_stops(Shine::Luna, inactive, Color32::WHITE, false);
+            assert_eq!(old[0], (0.0, crate::derive::shade(inactive, 0.1)));
+            assert_eq!(old.len(), 8);
         }
     }
 }

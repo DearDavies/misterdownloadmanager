@@ -1798,6 +1798,10 @@ These ship in the next version.
   symbols, instead of greyish buttons with faint symbols; and XP's symbols in every state
   (Minimize a short thick bar low in the button, a thick-topped Maximize and Restore, a thick X)
   ([#1612](https://github.com/anefzaoui/misterdownloadmanager/issues/1612))
+- ✅ Luna, Windows 7 and Mac OS X: the title bar's buttons sit exactly inside their edges, with
+  no sliver of the face outside them; Luna's active bar has XP's brighter light band and rows,
+  and its buttons a pure white edge
+  ([#1612](https://github.com/anefzaoui/misterdownloadmanager/issues/1612))
 
 ## Being worked on
 
