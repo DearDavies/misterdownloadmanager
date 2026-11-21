@@ -3399,23 +3399,33 @@ thumb.addEventListener("mouseleave", () => { preview.classList.add("off"); docum
     }
   },
 
-  // #1496: the popup's Downloads tab on this computer's MDM: a finished file, one deleted from
-  // the disk since, a running one, a failed one, each with the system's icon for its type, its
-  // state and its buttons; the toolbar button's count; search and filters; every action the app
-  // does (off the screens: open, show in folder, copy the file and share are logged by the test
-  // instance instead of shown; Copy link writes to a stand-in clipboard, never the computer's);
-  // Delete and Clear finished ask first; the arrow keys. E2E_SHOTS: <lang>-<scheme>-dl-*.png,
-  // the states and widths for a pull request. E2E_RECENT_BEFORE=1: only the popup as it is (an
-  // older popup in the packed extension), for the "before" pictures.
   // #1613: the extension is loaded by hand here (Load unpacked in Chromium, a temporary add-on in
   // Firefox), so its popup says it won't update itself, with a link to its browser's store:
   // management.getSelf() answers "development", with no "management" permission.
-  // E2E_SHOTS: <browser>-<lang>-<scheme>-by-hand.png, the popup as it opens.
+  // E2E_SHOTS: <browser>-<lang>-<scheme>-by-hand.png, the popup as it opens. E2E_BYHAND_BEFORE=1:
+  // only that picture (an older popup in the packed extension), for the "before" pictures.
   async byhand(t) {
     if (!t.session.tab || !t.session.base) throw new Skip("the popup in a tab of its own");
     const shots = process.env.E2E_SHOTS ? path.resolve(process.env.E2E_SHOTS) : "";
     const lang = process.env.E2E_LANG || "en";
     const tag = `${t.name}-${lang}-${process.env.E2E_COLOR_SCHEME || "system"}`;
+    const picture = async (p, name) => {
+      if (!shots || !p.shot) return;
+      fs.mkdirSync(shots, { recursive: true });
+      await sleep(350);
+      await p.shot(path.join(shots, `${tag}-${name}.png`));
+    };
+    if (process.env.E2E_BYHAND_BEFORE === "1") {
+      const p = await t.session.tab(`${t.session.base}popup.html`);
+      try {
+        if (p.viewport) await p.viewport(400, 548);
+        await until("the popup", 10000, () => p.evaluate(`document.readyState === "complete" && Boolean(document.getElementById("status-text").textContent)`).catch(() => false));
+        await picture(p, "by-hand-before");
+        return "the popup as packed, pictured";
+      } finally {
+        await p.close();
+      }
+    }
     const firefox = t.kind === "firefox";
     const en = JSON.parse(fs.readFileSync(path.join(root, "extension", "_locales", "en", "messages.json"), "utf8"));
     const want = firefox
@@ -3440,17 +3450,21 @@ thumb.addEventListener("mouseleave", () => { preview.classList.add("off"); docum
       if (got.href !== want.href) throw new Error(`the store link is ${got.href}, not ${want.href}`);
       if (lang === "en" && (got.text !== want.text || got.link !== want.link)) throw new Error(`the line says ${JSON.stringify([got.text, got.link])}`);
       if (!got.text || !got.link || /^popup_/.test(got.text) || /^popup_/.test(got.link)) throw new Error(`no text: ${JSON.stringify(got)}`);
-      if (shots && p.shot) {
-        fs.mkdirSync(shots, { recursive: true });
-        await sleep(350);
-        await p.shot(path.join(shots, `${tag}-by-hand.png`));
-      }
+      await picture(p, "by-hand");
       return `installType ${got.installType}: "${got.text} ${got.link}" -> ${got.href}`;
     } finally {
       await p.close();
     }
   },
 
+  // #1496: the popup's Downloads tab on this computer's MDM: a finished file, one deleted from
+  // the disk since, a running one, a failed one, each with the system's icon for its type, its
+  // state and its buttons; the toolbar button's count; search and filters; every action the app
+  // does (off the screens: open, show in folder, copy the file and share are logged by the test
+  // instance instead of shown; Copy link writes to a stand-in clipboard, never the computer's);
+  // Delete and Clear finished ask first; the arrow keys. E2E_SHOTS: <lang>-<scheme>-dl-*.png,
+  // the states and widths for a pull request. E2E_RECENT_BEFORE=1: only the popup as it is (an
+  // older popup in the packed extension), for the "before" pictures.
   async recent(t) {
     if (!t.session.tab || !t.session.base) throw new Skip("the popup in a tab of its own");
     const shots = process.env.E2E_SHOTS ? path.resolve(process.env.E2E_SHOTS) : "";
