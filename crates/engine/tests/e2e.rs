@@ -1378,6 +1378,54 @@ async fn resume_goes_on_across_copies_with_one_digest() {
     );
 }
 
+/// #1577: a download paused before MDM kept digests (or on a server that sent none) learns
+/// its version's digest from a part the server validated with `If-Range`, keeps it in its
+/// state, and then goes on across copies.
+#[tokio::test]
+async fn a_resumed_download_learns_its_digest_from_a_validated_part() {
+    let s = server("rate=1M").await;
+    let (dir, state) = paused(&s, "/gen/8M/model.gguf?seed=29").await;
+    let first = mdm_engine::state::ResumeState::load(&state).unwrap();
+    assert!(first.validators.digests.is_empty());
+    // One copy, now sending its digest: resumed, then paused again a little later.
+    s.set_faults(Faults::parse("rate=1M&digest=1").unwrap());
+    let opts = Options {
+        save_interval: std::time::Duration::from_millis(100),
+        ..fast_opts()
+    };
+    let dl = Download::resume(state.clone(), Default::default(), opts).unwrap();
+    // Further than the first pause: parts came in, validated.
+    let start = first.downloaded();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while dl.snapshot().downloaded < start + (512 << 10) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the resume never went on"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    dl.cancel();
+    assert!(matches!(dl.wait().await, Err(mdm_engine::Error::Cancelled)));
+    tokio::time::timeout(SETTLE, s.settled()).await.unwrap();
+    let saved = mdm_engine::state::ResumeState::load(&state).unwrap();
+    assert!(
+        !saved.validators.digests.is_empty(),
+        "{:?}",
+        saved.validators
+    );
+    // Now behind a CDN with the other copy too.
+    s.set_faults(Faults::parse("rate=4M&digest=1&nodes=2").unwrap());
+    let out = Download::resume(state, Default::default(), fast_opts())
+        .unwrap()
+        .wait()
+        .await
+        .expect("goes on by the digest it learned");
+    let mut want = vec![0; 8 << 20];
+    content::fill(29, 0, &mut want);
+    assert!(std::fs::read(&out.path).unwrap() == want);
+    drop(dir);
+}
+
 /// The same copies without a digest: nothing proves they are one file, so a resumed download
 /// that meets the other copy stops, as before (#1577: never two versions in one file).
 #[tokio::test]

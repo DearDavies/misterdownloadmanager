@@ -4518,7 +4518,7 @@ async fn request(ctx: &Ctx, target: &Target, from: u64, to: u64) -> Result<Body,
     }
     match head.status {
         // A part of another file: its whole file's digest isn't the download's (#1577).
-        StatusCode::PARTIAL_CONTENT if !digest_agrees(ctx, &head) => {
+        StatusCode::PARTIAL_CONTENT if !digest_agrees(ctx, if_range.is_some(), &head) => {
             return Err(Error::FileChanged);
         }
         StatusCode::PARTIAL_CONTENT => {
@@ -4710,12 +4710,22 @@ fn copy_by_digest(ctx: &Ctx, sent: Option<&HeaderValue>, resp: &Head) -> bool {
 }
 
 /// Whether a part's answer may be this file's by its digest: one it carries must be the
-/// download's; once copies are told apart only by it (`by_digest`), it must carry one.
-fn digest_agrees(ctx: &Ctx, resp: &Head) -> bool {
-    let v = ctx.validators.lock().unwrap();
-    match v.same_digest(&digests_of(&resp.headers)) {
+/// download's; once copies are told apart only by it (`by_digest`), it must carry one. A
+/// download without a digest yet (started before MDM kept them, or on a server that sent none)
+/// learns it from a part the server validated (`validated`: it was asked with `If-Range`): that
+/// part is the version on disk, so its digest is too.
+fn digest_agrees(ctx: &Ctx, validated: bool, resp: &Head) -> bool {
+    let mut v = ctx.validators.lock().unwrap();
+    let theirs = digests_of(&resp.headers);
+    match v.same_digest(&theirs) {
         Some(same) => same,
-        None => !v.by_digest,
+        None if v.by_digest => false,
+        None => {
+            if validated && v.digests.is_empty() {
+                v.digests = theirs;
+            }
+            true
+        }
     }
 }
 
