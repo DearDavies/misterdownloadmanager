@@ -597,6 +597,32 @@ async fn per_node_etags_fall_back_to_the_date() {
     );
 }
 
+/// #1577: a CDN in front of two copies of the file, each with its own ETag and Last-Modified
+/// (ModelScope's nodes fetch from two origins), both sending the whole file's digest. A copy
+/// that doesn't match the `If-Range` answers with the whole file: the download goes on by the
+/// digest, segmented, instead of falling back to one connection or stopping with "the file
+/// changed on the server".
+#[tokio::test]
+async fn copies_with_their_own_validators_go_on_by_their_digest() {
+    let s = server("rate=4M&nodes=2&digest=1").await;
+    let (log, size) = fetch(&s, "/gen/8M?seed=23", 23, fast_opts()).await;
+    assert_eq!(size, 8 << 20);
+    assert!(
+        log.iter().any(|e| e.range.is_some() && e.status == 200),
+        "the other copy refused the If-Range"
+    );
+    assert!(
+        log.iter()
+            .filter(|e| e.status == 206 && e.if_range.is_none())
+            .count()
+            > 1,
+        "still segmented, by the digest: {:?}",
+        log.iter()
+            .map(|e| (e.status, e.if_range.clone()))
+            .collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test]
 async fn sockets_are_reused_between_segments() {
     // Every other connection is slow: the fast ones finish early and take over the rest of the
@@ -1324,6 +1350,118 @@ async fn resume_detects_changed_file() {
         .await
         .unwrap_err();
     assert!(matches!(err, mdm_engine::Error::FileChanged), "{err}");
+}
+
+/// #1577: a download paused on one copy goes on when its CDN now also serves another copy (its
+/// own ETag and date, the same digest), on several connections, and the file is whole.
+#[tokio::test]
+async fn resume_goes_on_across_copies_with_one_digest() {
+    let s = server("rate=1M&digest=1").await;
+    let (_dir, state) = paused(&s, "/gen/8M/model.gguf?seed=25").await;
+    let saved = mdm_engine::state::ResumeState::load(&state).unwrap();
+    assert!(!saved.validators.digests.is_empty(), "the digest is kept");
+    s.set_faults(Faults::parse("rate=1M&digest=1&nodes=2").unwrap());
+    s.clear_log();
+    let out = Download::resume(state.clone(), Default::default(), fast_opts())
+        .unwrap()
+        .wait()
+        .await
+        .expect("goes on by the digest");
+    let mut want = vec![0; 8 << 20];
+    content::fill(25, 0, &mut want);
+    assert!(std::fs::read(&out.path).unwrap() == want);
+    tokio::time::timeout(SETTLE, s.settled()).await.unwrap();
+    assert!(
+        s.log()
+            .iter()
+            .any(|e| e.status == 206 && e.if_range.is_none())
+    );
+}
+
+/// The same copies without a digest: nothing proves they are one file, so a resumed download
+/// that meets the other copy stops, as before (#1577: never two versions in one file).
+#[tokio::test]
+async fn resume_across_copies_without_a_digest_stops() {
+    let s = server("rate=1M").await;
+    let (_dir, state) = paused(&s, "/gen/8M/model.gguf?seed=28").await;
+    s.set_faults(Faults::parse("rate=1M&nodes=2").unwrap());
+    let err = Download::resume(state, Default::default(), fast_opts())
+        .unwrap()
+        .wait()
+        .await
+        .unwrap_err();
+    assert!(matches!(err, mdm_engine::Error::FileChanged), "{err}");
+    tokio::time::timeout(SETTLE, s.settled()).await.unwrap();
+}
+
+/// The guarantee behind going on by the digest: a file that really changed (another digest on
+/// every copy) still stops the download, and the connections don't stay "Connecting...".
+#[tokio::test]
+async fn resume_across_copies_stops_when_the_digest_changes() {
+    let s = server("rate=1M&digest=1").await;
+    let (dir, state) = paused(&s, "/gen/8M/model.gguf?seed=26").await;
+    let part = mdm_engine::naming::part_path(&dir.path().join("model.gguf"));
+    let before = std::fs::read(&part).unwrap();
+    // Every answer from now on is another version (`etag_change_every=1`: its ETag, date and
+    // digest), from either copy.
+    s.set_faults(Faults::parse("rate=1M&digest=1&nodes=2&etag_change_every=1").unwrap());
+    let dl = Download::resume(state, Default::default(), fast_opts()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while dl.snapshot().state != mdm_engine::download::State::Failed {
+        assert!(std::time::Instant::now() < deadline, "it never stopped");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let conns = dl.snapshot().connections;
+    assert!(
+        conns.iter().all(|c| !matches!(
+            c.status,
+            mdm_engine::download::ConnStatus::Connecting
+                | mdm_engine::download::ConnStatus::Receiving
+                | mdm_engine::download::ConnStatus::Retrying(_)
+        )),
+        "{conns:?}"
+    );
+    let err = dl.wait().await.unwrap_err();
+    assert!(matches!(err, mdm_engine::Error::FileChanged), "{err}");
+    assert!(std::fs::read(&part).unwrap() == before, "nothing written");
+}
+
+/// Once copies are told apart by their digest only (no `If-Range` sent), a part that carries
+/// no digest, or another one, is never written.
+#[tokio::test]
+async fn a_part_without_the_digest_is_refused_once_going_by_it() {
+    for (faults, digest) in [
+        ("rate=1M", "x-oss-hash-crc64ecma=1"),
+        ("rate=1M&digest=1", "x-oss-hash-crc64ecma=1"),
+    ] {
+        let s = server(faults).await;
+        let (dir, state) = paused(&s, "/gen/8M/model.gguf?seed=27").await;
+        let mut saved = mdm_engine::state::ResumeState::load(&state).unwrap();
+        saved.validators = mdm_engine::state::Validators {
+            digests: vec![digest.into()],
+            by_digest: true,
+            ..Default::default()
+        };
+        std::fs::write(&state, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let part = mdm_engine::naming::part_path(&dir.path().join("model.gguf"));
+        let before = std::fs::read(&part).unwrap();
+        s.clear_log();
+        let err = Download::resume(state, Default::default(), fast_opts())
+            .unwrap()
+            .wait()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, mdm_engine::Error::FileChanged),
+            "{faults}: {err}"
+        );
+        assert!(
+            std::fs::read(&part).unwrap() == before,
+            "{faults}: nothing written"
+        );
+        tokio::time::timeout(SETTLE, s.settled()).await.unwrap();
+        assert!(s.log().iter().all(|e| e.if_range.is_none()), "{faults}");
+    }
 }
 
 /// A different mirror's same-size answer under other validators must not replace the
