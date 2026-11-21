@@ -1426,6 +1426,53 @@ async fn a_resumed_download_learns_its_digest_from_a_validated_part() {
     drop(dir);
 }
 
+/// #1577: a download paused without a digest, resumed where both copies answer: an answer from
+/// the other copy waits until a part of its own version teaches it the digest, then it goes on
+/// by it, in the same run.
+#[tokio::test]
+async fn resume_without_a_digest_learns_it_while_the_other_copy_answers() {
+    let s = server("rate=1M").await;
+    let (_dir, state) = paused(&s, "/gen/8M/model.gguf?seed=30").await;
+    assert!(
+        mdm_engine::state::ResumeState::load(&state)
+            .unwrap()
+            .validators
+            .digests
+            .is_empty()
+    );
+    s.set_faults(Faults::parse("rate=1M&digest=1&nodes=2").unwrap());
+    let out = Download::resume(state, Default::default(), fast_opts())
+        .unwrap()
+        .wait()
+        .await
+        .expect("goes on by the digest it learned");
+    let mut want = vec![0; 8 << 20];
+    content::fill(30, 0, &mut want);
+    assert!(std::fs::read(&out.path).unwrap() == want);
+}
+
+/// ... and when no part of its version comes (the file changed on every copy), the wait ends and
+/// the download stops as a changed file, nothing written.
+#[tokio::test]
+async fn resume_without_a_digest_stops_when_every_copy_changed() {
+    let s = server("rate=1M").await;
+    let (dir, state) = paused(&s, "/gen/8M/model.gguf?seed=31").await;
+    let part = mdm_engine::naming::part_path(&dir.path().join("model.gguf"));
+    let before = std::fs::read(&part).unwrap();
+    s.set_faults(Faults::parse("rate=1M&digest=1&nodes=2&etag_change_every=1").unwrap());
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        Download::resume(state, Default::default(), fast_opts())
+            .unwrap()
+            .wait(),
+    )
+    .await
+    .expect("the wait for a digest ends")
+    .unwrap_err();
+    assert!(matches!(err, mdm_engine::Error::FileChanged), "{err}");
+    assert!(std::fs::read(&part).unwrap() == before, "nothing written");
+}
+
 /// The same copies without a digest: nothing proves they are one file, so a resumed download
 /// that meets the other copy stops, as before (#1577: never two versions in one file).
 #[tokio::test]

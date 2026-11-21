@@ -1688,6 +1688,9 @@ struct Ctx {
     wait_for_ranges: bool,
     /// Signalled by every 206 answer.
     range_answered: tokio::sync::Notify,
+    /// Signalled when a download without a digest learns its version's from a validated part
+    /// (`digest_agrees`): an answer from another copy waits for it (`await_digest`, #1577).
+    digest_learned: tokio::sync::Notify,
     /// Where a POST download's redirects turned into GETs (refreshing the target).
     as_get: AsGet,
     /// The file itself is a web page; otherwise an HTML answer is a sign-in wall or an error.
@@ -2495,6 +2498,7 @@ async fn run_fresh(
             advertised,
             wait_for_ranges,
             range_answered: Default::default(),
+            digest_learned: Default::default(),
             as_get,
             web_page_ok: expects_web_page(&dest, content_type.as_deref()),
             never_page,
@@ -2731,6 +2735,7 @@ async fn run_fresh_ftp(
             advertised: true,
             wait_for_ranges: false,
             range_answered: Default::default(),
+            digest_learned: Default::default(),
             as_get: AsGet::default(),
             web_page_ok: true,
             never_page: false,
@@ -2951,6 +2956,7 @@ async fn run_resume(
         ranges: AtomicU8::new(RANGES_YES),
         advertised: true,
         range_answered: Default::default(),
+        digest_learned: Default::default(),
         as_get,
         web_page_ok,
         never_page,
@@ -4516,6 +4522,11 @@ async fn request(ctx: &Ctx, target: &Target, from: u64, to: u64) -> Result<Body,
     if head.status.is_success() && !ctx.web_page_ok && is_web_page(&head.headers) {
         return Err(Error::GotWebPage);
     }
+    // Another copy's whole answer, with a digest, where the download has none yet to compare it
+    // with: another connection's validated part may teach it in a moment (#1577).
+    if head.status == StatusCode::OK && unproven_copy(ctx, if_range.as_ref(), &head) {
+        await_digest(ctx).await?;
+    }
     match head.status {
         // A part of another file: its whole file's digest isn't the download's (#1577).
         StatusCode::PARTIAL_CONTENT if !digest_agrees(ctx, if_range.is_some(), &head) => {
@@ -4679,21 +4690,11 @@ fn is_other_server_copy(ours: &Validators, theirs: &Validators, at: &Url, same_l
 /// takes only answers that carry that digest (`digest_agrees`): a part of another version
 /// carries another digest, or none, and is never written.
 fn copy_by_digest(ctx: &Ctx, sent: Option<&HeaderValue>, resp: &Head) -> bool {
-    let Some(sent) = sent.and_then(|s| s.to_str().ok()) else {
+    if !refused_if_range(ctx, sent, resp) {
         return false;
-    };
-    // The answer's validator of the kind sent: the same one means the server ignored the
-    // range (no ranges, or an edge without them), not another copy.
-    let h = &resp.headers;
-    let theirs = match sent.starts_with('"') {
-        true => header_str(h, header::ETAG),
-        false => header_str(h, header::LAST_MODIFIED),
-    };
+    }
     let mut v = ctx.validators.lock().unwrap();
-    if theirs == Some(sent)
-        || resp.len != Some(ctx.size)
-        || v.same_digest(&digests_of(h)) != Some(true)
-    {
+    if v.same_digest(&digests_of(&resp.headers)) != Some(true) {
         return false;
     }
     if !v.by_digest {
@@ -4709,6 +4710,51 @@ fn copy_by_digest(ctx: &Ctx, sent: Option<&HeaderValue>, resp: &Head) -> bool {
     true
 }
 
+/// A full answer, at the file's length, to an `If-Range` whose validator it doesn't carry: the
+/// copy it came from isn't the one the download started on (or the file changed). The same
+/// validator back means the server ignored the range (no ranges, or an edge without them).
+fn refused_if_range(ctx: &Ctx, sent: Option<&HeaderValue>, resp: &Head) -> bool {
+    let Some(sent) = sent.and_then(|s| s.to_str().ok()) else {
+        return false;
+    };
+    let h = &resp.headers;
+    let theirs = match sent.starts_with('"') {
+        true => header_str(h, header::ETAG),
+        false => header_str(h, header::LAST_MODIFIED),
+    };
+    theirs != Some(sent) && resp.len == Some(ctx.size)
+}
+
+/// How long an answer from another copy waits for the download to learn its digest.
+const DIGEST_WAIT: Duration = Duration::from_secs(10);
+
+/// [`refused_if_range`] with a digest, where the download has none yet (it started before MDM
+/// kept them, or on an answer without one): the same file or another can't be told yet.
+fn unproven_copy(ctx: &Ctx, sent: Option<&HeaderValue>, resp: &Head) -> bool {
+    let v = ctx.validators.lock().unwrap();
+    v.digests.is_empty()
+        && !v.by_digest
+        && refused_if_range(ctx, sent, resp)
+        && !digests_of(&resp.headers).is_empty()
+}
+
+/// Wait, at most [`DIGEST_WAIT`], for another connection's validated part to teach the
+/// download its digest (`digest_agrees`); then the answer is judged by it (`copy_by_digest`),
+/// and without one it is a changed file, as before.
+async fn await_digest(ctx: &Ctx) -> Result<(), Error> {
+    let learned = ctx.digest_learned.notified();
+    tokio::pin!(learned);
+    learned.as_mut().enable();
+    if !ctx.validators.lock().unwrap().digests.is_empty() {
+        return Ok(());
+    }
+    cancellable(&ctx.cancel, async {
+        let _ = tokio::time::timeout(DIGEST_WAIT, learned).await;
+        Ok(())
+    })
+    .await
+}
+
 /// Whether a part's answer may be this file's by its digest: one it carries must be the
 /// download's; once copies are told apart only by it (`by_digest`), it must carry one. A
 /// download without a digest yet (started before MDM kept them, or on a server that sent none)
@@ -4721,8 +4767,9 @@ fn digest_agrees(ctx: &Ctx, validated: bool, resp: &Head) -> bool {
         Some(same) => same,
         None if v.by_digest => false,
         None => {
-            if validated && v.digests.is_empty() {
+            if validated && v.digests.is_empty() && !theirs.is_empty() {
                 v.digests = theirs;
+                ctx.digest_learned.notify_waiters();
             }
             true
         }
