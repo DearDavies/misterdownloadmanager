@@ -569,6 +569,9 @@ Bug fixes from the first days of 0.5.0, a Safari extension, and more file types.
 
 Everything below ships together, in version 0.6.0, the next release.
 
+- ✅ The shared Craft libraries for saving files and for translations brought up to date: the
+  temporary files a save cut short by a crash leaves in the data folder are removed at the next
+  start, and a file saved over keeps more of the original (its attributes, its group)
 - ✅ Google Drive shared folders: a folder's link in Add URL, Link grabber or the browser's
   right-click command opens its files and its subfolders' in Link grabber, ticked, named and
   sized as Drive lists them, downloaded into the same folders on disk; Docs, Sheets and Slides
